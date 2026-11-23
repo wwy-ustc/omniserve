@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="OmniServe 并发语音推理控制台">
+  <title>OmniServe · 语音推理</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="shell header-inner">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+        <span>OmniServe</span>
+      </div>
+      <div id="connection" class="connection" data-state="pending">连接中</div>
+    </div>
+  </header>
+
+  <main class="shell">
+    <div class="intro">
+      <div>
+        <h1>语音推理控制台</h1>
+        <p>提交多条语音，实时查看转写、生成结果和阶段重叠。</p>
+      </div>
+      <div class="workers">
+        <div class="worker">
+          <span class="worker-icon asr-icon" aria-hidden="true">C</span>
+          <div><b>Whisper</b><small>CPU 转写</small></div>
+        </div>
+        <div class="worker">
+          <span class="worker-icon llm-icon" aria-hidden="true">Q</span>
+          <div><b>Qwen</b><small id="device">等待推理设备</small></div>
+        </div>
+      </div>
+    </div>
+
+    <section class="panel upload-panel" aria-labelledby="upload-title">
+      <div>
+        <h2 id="upload-title">新建语音请求</h2>
+        <p class="muted">可同时上传多个音频，也可用麦克风录制。</p>
+      </div>
+      <div class="input-actions">
+        <input id="files" type="file" accept="audio/*,video/webm,video/mp4,.flac,.opus,.ogg,.m4a,.wav,.mp3,.aac,.caf,.aif,.aiff" multiple hidden>
+        <button class="primary" id="upload" type="button">上传音频</button>
+        <button class="secondary" id="record" type="button" aria-pressed="false"><span class="mic-dot" aria-hidden="true"></span><span id="record-label">开始录音</span></button>
+      </div>
+      <p class="notice" id="notice" role="status" hidden></p>
+    </section>
+
+    <section class="panel timeline-panel" aria-labelledby="timeline-title">
+      <div class="panel-heading">
+        <div>
+          <h2 id="timeline-title">请求时间线</h2>
+          <p class="muted">各行共用同一时间轴，重合的阶段表示请求同时推进。</p>
+        </div>
+        <div class="legend" aria-label="颜色图例">
+          <span><i class="key queue"></i>等待</span>
+          <span><i class="key asr"></i>转写</span>
+          <span><i class="key llm"></i>生成</span>
+        </div>
+      </div>
+      <p class="overlap" id="overlap" hidden></p>
+      <div class="timeline-empty" id="timeline-empty">提交音频后，这里会显示各请求的执行时间。</div>
+      <div id="timeline-scroll" class="timeline-scroll" hidden>
+        <div class="timeline" id="timeline"></div>
+      </div>
+    </section>
+
+    <div class="bottom">
+      <section class="panel history-panel" aria-labelledby="history-title">
+        <div class="panel-heading">
+          <h2 id="history-title">请求列表</h2>
+          <span id="request-count" class="count">0 条</span>
+        </div>
+        <p class="empty muted" id="history-empty">暂无语音请求。</p>
+        <ul class="history" id="history"></ul>
+      </section>
+      <section class="panel detail-panel" aria-labelledby="detail-title">
+        <div class="panel-heading">
+          <div class="detail-heading">
+            <h2 id="detail-title">请求详情</h2>
+            <p class="muted detail-name" id="detail-name" hidden></p>
+          </div>
+          <span id="detail-status" class="badge" hidden></span>
+        </div>
+        <p class="empty muted" id="detail-empty">选择一个请求以查看转写与回答。</p>
+        <div id="detail-content" hidden>
+          <dl class="detail-times" id="detail-times"></dl>
+          <div class="detail-output">
+            <h3>语音转写</h3>
+            <p class="output" id="transcript"></p>
+            <h3>模型回答</h3>
+            <p class="output answer" id="answer"></p>
+          </div>
+          <p class="detail-error" id="error" hidden></p>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
