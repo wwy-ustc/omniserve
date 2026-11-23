@@ -65,6 +65,8 @@ class VoicePipeline:
 
             self.scheduler = Scheduler(llm.model, llm.device, max_batch_size)
         self.decode_trace = deque(maxlen=2048)
+        self.decode_count = 0
+        self.server_id = uuid4().hex
         self.jobs = OrderedDict()
         self.lock = Lock()
         self.asr_queue = Queue()
@@ -141,6 +143,26 @@ class VoicePipeline:
         with self.lock:
             return list(self.decode_trace)
 
+    def record_decode(self, job_ids, cache_lengths):
+        with self.lock:
+            self.decode_count += 1
+            self.decode_trace.append({
+                "sequence": self.decode_count, "at_ms": now_ms(),
+                "job_ids": list(job_ids), "cache_lengths": list(cache_lengths),
+            })
+
+    def decode_snapshot(self, after=None):
+        with self.lock:
+            oldest = self.decode_trace[0]["sequence"] if self.decode_trace else self.decode_count + 1
+            return {
+                "server_id": self.server_id,
+                "decodes": [step for step in self.decode_trace
+                            if after is None or step["sequence"] > after],
+                "next_cursor": self.decode_count,
+                "oldest_cursor": oldest,
+                "truncated": after is not None and after < oldest - 1,
+            }
+
     def publish(self, job, text):
         with self.lock:
             if text and job.first_token_ms is None:
@@ -192,10 +214,7 @@ class VoicePipeline:
                 continue
             try:
                 lengths = self.scheduler.decode([active[job_id][1] for job_id in ready])
-                with self.lock:
-                    self.decode_trace.append({
-                        "at_ms": now_ms(), "job_ids": ready, "cache_lengths": lengths,
-                    })
+                self.record_decode(ready, lengths)
             except Exception as exc:
                 # A failed forward may have mutated cache state, so fail its whole group.
                 for job_id in ready:
@@ -258,7 +277,8 @@ def make_handler(pipeline, assets, max_audio_seconds, max_new_tokens):
             if not self.allowed_host():
                 self.send_json(HTTPStatus.FORBIDDEN, {"error": "请使用本机地址访问 OmniServe。"})
                 return
-            path = urlsplit(self.path).path
+            url = urlsplit(self.path)
+            path = url.path
             if path in assets:
                 mime_type, content = assets[path]
                 self.send_bytes(HTTPStatus.OK, mime_type, content)
@@ -269,6 +289,9 @@ def make_handler(pipeline, assets, max_audio_seconds, max_new_tokens):
                     "asr_device": "cpu",
                     "llm_dtype": str(pipeline.llm.dtype),
                     "max_batch_size": pipeline.scheduler.max_active if pipeline.scheduler else 1,
+                    "max_active_jobs": MAX_ACTIVE,
+                    "server_id": pipeline.server_id,
+                    "decode_trace_capacity": pipeline.decode_trace.maxlen,
                     "mode": pipeline.mode,
                     "llm_model": pipeline.llm.model_id,
                     "llm_revision": pipeline.llm.revision,
@@ -277,7 +300,15 @@ def make_handler(pipeline, assets, max_audio_seconds, max_new_tokens):
                     "cuda_peak_allocated_mb": None if peak is None else peak / (1024 ** 2),
                 })
             elif path == "/api/decode-trace":
-                self.send_json(HTTPStatus.OK, {"decodes": pipeline.recent_decodes()})
+                try:
+                    raw = parse_qs(url.query).get("after", [None])[0]
+                    after = None if raw is None else int(raw)
+                    if after is not None and after < 0:
+                        raise ValueError
+                except ValueError:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "after must be a nonnegative cursor."})
+                    return
+                self.send_json(HTTPStatus.OK, pipeline.decode_snapshot(after))
             elif path == "/api/jobs":
                 jobs = pipeline.list_jobs()
                 self.send_json(HTTPStatus.OK, {

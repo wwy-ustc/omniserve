@@ -12,7 +12,10 @@ from batching_baseline import (
     PROMPTS, benchmark, encode, eos_ids, generate, load_local, prepare, trim,
 )
 from workers.decode_scheduler import Request, Scheduler
-from workers.llm_worker import MODEL_ID, positive_int, synchronize
+from workers.llm_worker import (
+    DEVICE_CHOICES, MODEL_ID, device_metadata, peak_memory, positive_int,
+    reset_peak_memory, synchronize,
+)
 
 
 @torch.inference_mode()
@@ -50,12 +53,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=MODEL_ID)
     parser.add_argument("--revision")
-    parser.add_argument("--device", choices=("mps", "cpu"), default=(
-        "mps" if torch.backends.mps.is_available() else "cpu"
-    ))
+    parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto")
+    parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--warmup", type=positive_int, default=1)
     parser.add_argument("--compare", action="store_true",
                         help="Benchmark all three modes on the same simultaneous requests.")
+    parser.add_argument("--strict-token-match", action="store_true",
+                        help="Fail if batch shapes produce different greedy token IDs.")
     parser.add_argument("--runs", type=positive_int, default=6, help="Measured trials per mode in --compare.")
     parser.add_argument("--max-new-tokens", type=positive_int, default=32, help="Token limit in --compare.")
     args = parser.parse_args()
@@ -65,12 +69,15 @@ def main():
         requests = [Request(0, row, args.max_new_tokens) for row in rows]
         scheduler = Scheduler(model, args.device, max_active=len(requests))
         result = benchmark(model, tokenizer, rows, args, continuous=lambda: run(scheduler, requests))
-        if not all(result["matching_token_ids"] + result["continuous_matching_token_ids"]):
+        if args.strict_token_match and not all(
+            result["matching_token_ids"] + result["continuous_matching_token_ids"]
+        ):
             raise RuntimeError("The three modes produced different token IDs on this workload.")
         print(json.dumps({
             "model": args.model, "revision": revision, "device": args.device,
             "dtype": str(model.dtype), "torch": torch.__version__,
             "transformers": transformers.__version__, "warmup_per_mode": args.warmup,
+            **device_metadata(args.device),
             "runs_per_mode": args.runs, "max_new_tokens": args.max_new_tokens,
             "input_lengths": list(map(len, rows)), "prompts": PROMPTS,
             "arrival_ticks": [r.arrival for r in requests], **result,
@@ -84,10 +91,12 @@ def main():
     for _ in range(args.warmup):
         run(scheduler, requests)
     synchronize(args.device)
+    reset_peak_memory(args.device)
     start = perf_counter()
     tokens, trace = run(scheduler, requests)
     synchronize(args.device)
     elapsed = perf_counter() - start
+    memory = peak_memory(args.device)
 
     stops = eos_ids(model)
     expected = [
@@ -95,7 +104,7 @@ def main():
                       r.max_new_tokens, tokenizer.pad_token_id)[0].tolist(), stops)
         for r in requests
     ]
-    if tokens != expected:
+    if args.strict_token_match and tokens != expected:
         raise RuntimeError(f"Continuous outputs differ from standalone generation: {tokens} != {expected}")
     late_admission = any(2 in step["admitted"] and step["decode_request_ids"] == [1] for step in trace)
     shared_decode = any(step["decode_request_ids"] == [1, 2]
@@ -106,14 +115,17 @@ def main():
     print(json.dumps({
         "model": args.model, "revision": revision, "device": args.device,
         "dtype": str(model.dtype), "max_active": scheduler.max_active, "seconds": elapsed,
-        "matches_standalone": True,
+        **device_metadata(args.device), **memory,
+        "matches_standalone": tokens == expected,
         "shared_decode_forwards": sum(len(step["decode_request_ids"]) > 1 for step in trace),
         "requests": [
             {"arrival": r.arrival, "input_tokens": len(r.input_ids),
              "max_new_tokens": r.max_new_tokens, "token_ids": output,
              "finish": "eos" if output[-1] in stops else "length",
-             "text": tokenizer.decode(output, skip_special_tokens=True)}
-            for r, output in zip(requests, tokens, strict=True)
+             "text": tokenizer.decode(output, skip_special_tokens=True),
+             "matches_standalone": output == reference,
+             "standalone_token_ids": reference}
+            for r, output, reference in zip(requests, tokens, expected, strict=True)
         ],
         "trace": trace,
     }, ensure_ascii=False, indent=2))

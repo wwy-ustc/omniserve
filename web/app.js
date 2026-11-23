@@ -12,6 +12,8 @@ const statusLabels = {
 const terminal = new Set(["done", "error"]);
 const state = { jobs: [], now: 0, selected: null, historyKey: "", timelineKey: "" };
 let recording = null;
+// Leave room for encoder padding below the server's 30-second audio limit.
+const MAX_RECORDING_MS = 29000;
 
 function element(tag, className, value) {
   const node = document.createElement(tag);
@@ -315,6 +317,7 @@ recordButton.addEventListener("click", async () => {
     const recorder = new MediaRecorder(stream);
     const chunks = [];
     let failed = false;
+    let stopTimer;
     recorder.addEventListener("dataavailable", ({ data }) => {
       if (data.size > 0) chunks.push(data);
     });
@@ -323,6 +326,7 @@ recordButton.addEventListener("click", async () => {
       notice("录音中断，请重试或上传音频文件。", "error");
     });
     recorder.addEventListener("stop", () => {
+      window.clearTimeout(stopTimer);
       stream.getTracks().forEach((track) => track.stop());
       recording = null;
       recordButton.disabled = false;
@@ -338,9 +342,15 @@ recordButton.addEventListener("click", async () => {
       submitFiles([{ blob, name: `录音 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}.${extension}` }]);
     }, { once: true });
     recorder.start();
+    stopTimer = window.setTimeout(() => {
+      if (recorder.state !== "inactive") {
+        recordButton.disabled = true;
+        recorder.stop();
+      }
+    }, MAX_RECORDING_MS);
     recording = recorder;
     setRecordingState(true);
-    notice("正在录音，点「结束并提交」发送。");
+    notice("正在录音，点「结束并提交」发送；约 29 秒后自动提交。");
   } catch (_) {
     stream?.getTracks().forEach((track) => track.stop());
     notice("无法开始录音，请检查麦克风权限或上传音频。", "error");

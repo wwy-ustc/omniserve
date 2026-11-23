@@ -8,7 +8,7 @@ import statistics
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError
@@ -78,6 +78,8 @@ def parse_args():
     args = parser.parse_args()
     if args.concurrency > 256:
         parser.error("--concurrency must be at most 256 (the server's job history limit)")
+    if (args.concurrency - 1) * args.arrival_gap_ms >= args.timeout * 1000:
+        parser.error("the last scheduled upload must be before --timeout")
     if urlsplit(args.url).scheme not in ("http", "https") or not urlsplit(args.url).netloc:
         parser.error("--url must be an HTTP(S) server URL")
     args.url = args.url.rstrip("/")
@@ -99,9 +101,41 @@ def request_json(base_url, endpoint, *, audio=None, timeout=15):
         raise RuntimeError(f"{request.get_method()} {endpoint}: HTTP {exc.code} {detail}") from exc
 
 
+class DecodeCollector:
+    """Read each forward once and reject a result if the bounded server trace overflows."""
+
+    def __init__(self, base_url):
+        self.base_url = base_url
+        snapshot = request_json(base_url, "/api/decode-trace")
+        if "next_cursor" not in snapshot:
+            raise RuntimeError("Update voice_server.py before collecting continuous decode traces.")
+        self.cursor = snapshot["next_cursor"]
+        self.server_id = snapshot.get("server_id")
+        self.steps = []
+
+    def poll(self, timeout=15):
+        snapshot = request_json(
+            self.base_url, f"/api/decode-trace?after={self.cursor}", timeout=timeout,
+        )
+        if snapshot.get("truncated"):
+            raise RuntimeError("Decode trace overflowed; reduce --poll-ms and repeat the benchmark.")
+        if self.server_id is not None and snapshot.get("server_id") != self.server_id:
+            raise RuntimeError("Server restarted during decode trace collection.")
+        if snapshot["next_cursor"] < self.cursor:
+            raise RuntimeError("Server restarted during decode trace collection.")
+        self.steps.extend(snapshot["decodes"])
+        self.cursor = snapshot["next_cursor"]
+
+    def for_jobs(self, jobs):
+        ids = {job["id"] for job in jobs}
+        return [step for step in self.steps if ids.intersection(step["job_ids"])]
+
+
 def submit_audio(audio, base_url, deadline, start, start_at, arrival_index, gap_ms):
     start.wait()
     scheduled = start_at + arrival_index * gap_ms / 1000
+    if scheduled >= deadline:
+        raise TimeoutError("Scheduled upload is outside the burst deadline.")
     delay = scheduled - time.monotonic()
     if delay > 0:
         time.sleep(delay)
@@ -112,7 +146,7 @@ def submit_audio(audio, base_url, deadline, start, start_at, arrival_index, gap_
     return request_json(base_url, f"/api/jobs?{query}", audio=audio, timeout=timeout)
 
 
-def run_burst(executor, args, audio_files):
+def run_burst(executor, args, audio_files, trace_collector=None):
     # All upload threads wait for the same signal before issuing requests.
     start = threading.Event()
     start_at = time.monotonic()
@@ -123,8 +157,20 @@ def run_burst(executor, args, audio_files):
         for index, audio in enumerate(audio_files)
     ]
     start.set()
-    accepted = [future.result(timeout=max(0, deadline - time.monotonic()))
-                for future in futures]
+    # Collect traces during staggered uploads too: early jobs may finish before the
+    # final upload is sent and otherwise disappear from the bounded trace ring.
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Upload time exceeded the burst deadline.")
+        done, pending_uploads = wait(futures, timeout=min(args.poll_ms / 1000, remaining))
+        for future in done:
+            future.result()
+        if trace_collector is not None:
+            trace_collector.poll(timeout=max(0.001, min(deadline - time.monotonic(), 15)))
+        if not pending_uploads:
+            break
+    accepted = [future.result() for future in futures]
     job_ids = [job["id"] for job in accepted]
     pending = set(job_ids)
     completed = {}
@@ -133,6 +179,8 @@ def run_burst(executor, args, audio_files):
         if remaining <= 0:
             raise TimeoutError(f"Timed out waiting for jobs: {', '.join(sorted(pending))}")
         listing = request_json(args.url, "/api/jobs", timeout=min(remaining, 15))
+        if trace_collector is not None:
+            trace_collector.poll(timeout=max(0.001, min(deadline - time.monotonic(), 15)))
         for job in listing["jobs"]:
             job_id = job["id"]
             if job_id not in pending:
@@ -244,6 +292,9 @@ def main():
             raise ValueError(
                 f"Expected server mode {args.mode}, got {health_before.get('mode')}"
             )
+        active_limit = health_before.get("max_active_jobs")
+        if active_limit is not None and args.concurrency > active_limit:
+            raise ValueError(f"--concurrency exceeds the server's {active_limit} active job slots")
         bursts = []
         decode_traces = []
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
@@ -256,14 +307,11 @@ def main():
                 ]
                 print(f"{'Warmup' if is_warmup else 'Measure'} burst {index + 1}",
                       file=sys.stderr)
-                samples = run_burst(executor, args, cohort)
+                collector = DecodeCollector(args.url) if health_before["mode"] == "continuous" else None
+                samples = run_burst(executor, args, cohort, collector)
                 if not is_warmup:
                     bursts.append(samples)
-                    trace = []
-                    if health_before["mode"] == "continuous":
-                        ids = {job["id"] for job in samples}
-                        recent = request_json(args.url, "/api/decode-trace")["decodes"]
-                        trace = [step for step in recent if ids.intersection(step["job_ids"])]
+                    trace = collector.for_jobs(samples) if collector is not None else []
                     decode_traces.append(trace)
         result = {
             "mode": health_before.get("mode"),
@@ -274,10 +322,12 @@ def main():
             "audio": [audio.description() for audio in audio_files],
             "health_before": health_before,
             "health_after": request_json(args.url, "/health"),
+            "decode_trace_complete": True if health_before["mode"] == "continuous" else None,
             **summarize(bursts, decode_traces),
         }
         rendered = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
         if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(rendered, encoding="utf-8")
         print(rendered, end="")
     except (OSError, RuntimeError, ValueError, KeyError) as exc:

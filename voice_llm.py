@@ -5,6 +5,7 @@ from collections.abc import Callable
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from memory_budget import cuda_admission_budget, estimate_kv_bytes
 from workers.llm_worker import MODEL_ID, MODEL_REVISION
 
 
@@ -70,9 +71,10 @@ class VoiceLanguageModel:
         head_dim = getattr(config, "head_dim", None) or (
             config.hidden_size // config.num_attention_heads
         )
-        kv_bytes = (
-            2 * config.num_hidden_layers * config.num_key_value_heads * head_dim
-            * (input_tokens + self.max_new_tokens) * self.dtype.itemsize
+        kv_bytes = estimate_kv_bytes(
+            layers=config.num_hidden_layers, kv_heads=config.num_key_value_heads,
+            head_dim=head_dim, tokens=input_tokens + self.max_new_tokens,
+            element_bytes=self.dtype.itemsize,
         )
         budget = {
             "input_tokens": input_tokens,
@@ -82,13 +84,14 @@ class VoiceLanguageModel:
             "cuda_required_bytes": None,
         }
         if self.device == "cuda":
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-            # Reserve room for cache growth/copies and allocator/runtime overhead.
-            # Include two FP32 attention matrices as a conservative prefill allowance.
-            workspace_bytes = 2 * 4 * config.num_attention_heads * input_tokens ** 2
-            headroom_bytes = max(512 * 1024 ** 2, total_bytes // 10)
-            budget["cuda_free_bytes"] = free_bytes
-            budget["cuda_required_bytes"] = 2 * kv_bytes + workspace_bytes + headroom_bytes
+            free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+            budget.update(cuda_admission_budget(
+                kv_bytes=kv_bytes, input_tokens=input_tokens,
+                attention_heads=config.num_attention_heads,
+                driver_free_bytes=free_bytes, total_bytes=total_bytes,
+                reserved_bytes=torch.cuda.memory_reserved(self.device),
+                allocated_bytes=torch.cuda.memory_allocated(self.device),
+            ))
         return budget
 
     def fit(self, prompt: str) -> dict:

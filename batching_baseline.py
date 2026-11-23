@@ -1,4 +1,4 @@
-"""Offline three-request greedy generation benchmark for OmniServe."""
+"""Three-request greedy generation benchmark for OmniServe."""
 
 import argparse
 import json
@@ -8,7 +8,10 @@ from time import perf_counter
 import torch
 import transformers
 
-from workers.llm_worker import MODEL_ID, load_model, positive_int, synchronize
+from workers.llm_worker import (
+    DEVICE_CHOICES, MODEL_ID, device_metadata, load_model, peak_memory,
+    positive_int, reset_peak_memory, synchronize,
+)
 
 
 PROMPTS = (
@@ -23,9 +26,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=MODEL_ID)
     parser.add_argument("--revision")
-    parser.add_argument("--device", choices=("mps", "cpu"), default=(
-        "mps" if torch.backends.mps.is_available() else "cpu"
-    ))
+    parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto")
+    parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--warmup", type=positive_int, default=2)
     parser.add_argument("--runs", type=positive_int, default=5)
     parser.add_argument("--max-new-tokens", type=positive_int, default=32)
@@ -80,6 +82,7 @@ def benchmark(model, tokenizer, rows, args, *, continuous=None):
 
     def timed(mode):
         synchronize(args.device)
+        reset_peak_memory(args.device)
         start = perf_counter()
         if mode == "continuous_batch":
             tokens, trace = continuous()
@@ -96,6 +99,7 @@ def benchmark(model, tokenizer, rows, args, *, continuous=None):
             "generated_tokens": sum(map(len, tokens)),
             "tokens_per_second": sum(map(len, tokens)) / elapsed,
             "completed_requests_per_second": len(tokens) / elapsed,
+            **peak_memory(args.device),
         }
         if mode == "continuous_batch":
             sample["shared_decode_forwards"] = sum(
@@ -148,10 +152,10 @@ def benchmark(model, tokenizer, rows, args, *, continuous=None):
 
 
 def load_local(args):
-    if args.device == "mps" and not torch.backends.mps.is_available():
-        raise SystemExit("MPS is unavailable. Use --device cpu for a CPU run.")
-    args.local_files_only = True
-    model, tokenizer, revision = load_model(args)
+    try:
+        model, tokenizer, revision = load_model(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is None:
@@ -170,6 +174,7 @@ def main():
         "model": args.model, "revision": revision, "device": args.device,
         "dtype": str(model.dtype), "torch": torch.__version__,
         "transformers": transformers.__version__, "warmup_per_mode": args.warmup,
+        **device_metadata(args.device),
         "runs_per_mode": args.runs, "max_new_tokens": args.max_new_tokens,
         "input_lengths": list(map(len, rows)), "eos_ids": sorted(eos_ids(model)),
         "pad_id": tokenizer.pad_token_id, "prompts": PROMPTS, **result,

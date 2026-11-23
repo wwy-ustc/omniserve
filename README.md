@@ -2,6 +2,25 @@
 
 OmniServe 是一个本地并发语音推理服务。网页接收同时提交的多条录音或音频文件，显示 Whisper 转写、Qwen 流式文本回答，以及每个请求的转写、排队和生成时间线。
 
+项目重点是推理服务调度：CPU ASR 与 GPU LLM 流水线、请求独立 KV Cache、异长上下文共享 decode，以及有原始时间戳和 token 摘要的评测。CUDA 通过 PyTorch 后端执行，当前没有自写 CUDA kernel、分页 KV Cache 或多 GPU 支持。
+
+| 阅读入口 | 内容 |
+| --- | --- |
+| [CUDA 安装与验收](docs/CUDA.md) | Windows/Linux 配置、离线 GPU 自检、三种批处理对照、显存指标 |
+| [项目讲解与简历](docs/INTERVIEW.md) | 90 秒介绍、代码入口、简历表述、面试问答、演示步骤 |
+| [本次验证记录](docs/VALIDATION.md) | 已通过检查、跳过项和 GPU 实测状态 |
+
+## Windows CUDA 快速启动
+
+在项目根目录使用 Python 3.12：
+
+```powershell
+powershell -File tools/setup_windows.ps1 -Python python -Device cuda
+.\.venv\Scripts\python.exe voice_server.py --mode continuous --device cuda --max-batch-size 4
+```
+
+安装脚本先从 PyTorch CUDA wheel 源安装，再装项目依赖，最后用无需下载权重的微型 Qwen 检查 GPU 和缓存调度。若 Python 没加入 PATH，用 `-Python` 传入 Python 3.12 的完整路径。更详细步骤见 [CUDA 文档](docs/CUDA.md)。
+
 ## 启动
 
 使用 Python 3.12 和支持目标设备的 PyTorch。在 NVIDIA 机器上先使用适配驱动的 CUDA 版 PyTorch，再安装其余依赖。
@@ -57,6 +76,8 @@ python benchmarks/voice_benchmark.py --mode continuous --concurrency 4 \
 连续模式的 `/api/decode-trace` 保留最近 2048 次成功 decode 前向的时间、批内请求 ID 和有效 KV Cache 长度。多个请求 ID 表示一次共享模型前向。压测 JSON 收录相关记录，以及每条任务的生成 token 数和 token ID 序列摘要，可跨模式核对输出。现有 `first_token_ms` 字段记录服务端首次可见文本的时间，浏览器还受轮询间隔影响。当前批组变化和多请求 decode 会按层拼装、拆分 KV Cache，单请求 decode 直接复用自身缓存。
 
 ### Apple M5 端到端结果
+
+以下是原仓库保留的历史结果，仓库中没有附对应原始压测 JSON。本次 Windows 迁移未复测这些数字；它们不代表 RTX 3050 Ti 的性能。新增 CUDA 实验请保存 `tools/run_cuda_benchmarks.py` 和语音压测输出，再据实际数据填写简历。
 
 使用本机合成的四条英语语音，Whisper Tiny 在 CPU 转写，Qwen2.5-0.5B-Instruct 在 MPS 以 FP16 生成，每条最多 96 token。每个场景预热 1 轮、测量 5 轮。数值按 `pipeline → continuous` 列出。
 
